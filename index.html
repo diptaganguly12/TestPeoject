@@ -791,6 +791,198 @@
                 }
                 return this.queue.get(taskId);
             }
+			
+			// Poll for task status
+			pollTaskStatus(taskId) {
+				const task = this.queue.get(taskId);
+				if (!task) {
+					return;
+				}
+				
+				// Don't continue polling for completed, failed, or cancelled tasks
+				if (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled') {
+					return;
+				}
+				
+				fetch(`/api/analysis-status/${taskId}`)
+					.then(response => response.json())
+					.then(data => {
+						if (data.success) {
+							const status = data.data.status;
+							const progress = data.data.progress || task.progress;
+							
+							this.updateTask(taskId, { 
+								status: status,
+								progress: progress,
+								error: data.data.error || null
+							});
+							
+							if (status === 'completed') {
+								// Keep completed tasks in queue for 1 minute then remove
+								setTimeout(() => {
+									this.removeTask(taskId);
+								}, 60000);
+							} else if (status === 'failed' || status === 'cancelled') {
+								// Keep failed or cancelled tasks in queue for 5 minutes then remove
+								setTimeout(() => {
+									this.removeTask(taskId);
+								}, 300000);
+							} else {
+								// Continue polling if still processing
+								setTimeout(() => this.pollTaskStatus(taskId), 2000);
+							}
+						} else {
+							// Check if the error indicates task not found, which could mean it was cancelled
+							if (data.error && data.error.includes('not found')) {
+								this.updateTask(taskId, { 
+									status: 'cancelled',
+									progress: 100,
+									error: 'Task not found (may have been cancelled)'
+								});
+								return;
+							}
+							
+							// Retry on other errors
+							setTimeout(() => this.pollTaskStatus(taskId), 5000);
+						}
+					})
+					.catch(error => {
+						console.error('Error polling task status:', error);
+						// Retry on error
+						setTimeout(() => this.pollTaskStatus(taskId), 5000);
+					});
+			}
+		}
+
+		// Function to view task details
+		function viewTask(taskId) {
+			// This creates a modal to view detailed task information
+			const task = analysisQueue.getTask(taskId);
+			if (!task) {
+				showNotification('Task not found', 'danger');
+				return;
+			}
+			
+			// Create modal HTML
+			const modalId = 'taskModal' + Date.now();
+			const modalHTML = `
+				<div class="modal fade" id="${modalId}" tabindex="-1" aria-hidden="true">
+					<div class="modal-dialog modal-lg">
+						<div class="modal-content">
+							<div class="modal-header">
+								<h5 class="modal-title">Task Details: ${taskId}</h5>
+								<button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+							</div>
+							<div class="modal-body">
+								<div class="row">
+									<div class="col-md-6">
+										<div class="card mb-3">
+											<div class="card-header bg-primary text-white">
+												<h5 class="mb-0">Image Preview</h5>
+											</div>
+											<div class="card-body text-center">
+												<img src="/uploads/${task.metadata.filename}" 
+													 class="img-fluid rounded" style="max-height: 300px;">
+											</div>
+										</div>
+									</div>
+									<div class="col-md-6">
+										<div class="card mb-3">
+											<div class="card-header bg-primary text-white">
+												<h5 class="mb-0">Task Information</h5>
+											</div>
+											<div class="card-body">
+												<p><strong>Status:</strong> <span id="${modalId}-status">${getStatusBadge(task.status)}</span></p>
+												<p><strong>Added:</strong> ${new Date(task.added).toLocaleString()}</p>
+												<p><strong>Last Updated:</strong> ${new Date(task.updated).toLocaleString()}</p>
+												<p><strong>Location:</strong> ${task.metadata.hospital_name}, ${task.metadata.building}, ${task.metadata.floor}</p>
+												<p><strong>Category:</strong> ${task.metadata.category}</p>
+												<p><strong>Priority:</strong> ${task.metadata.priority ? 'High' : 'Normal'}</p>
+												${task.error ? `<p><strong>Error:</strong> <span class="text-danger">${task.error}</span></p>` : ''}
+											</div>
+										</div>
+										
+										<div class="card">
+											<div class="card-header bg-primary text-white">
+												<h5 class="mb-0">Actions</h5>
+											</div>
+											<div class="card-body">
+												<div class="progress mb-3" style="height: 20px;">
+													<div class="progress-bar ${getProgressBarClass(task.status)}" 
+														role="progressbar" style="width: ${task.progress}%">
+														${task.progress}%
+													</div>
+												</div>
+												<div class="d-flex gap-2">
+													${task.status === 'pending' ? `
+														<button class="btn btn-danger" onclick="cancelTask('${taskId}'); document.getElementById('${modalId}-status').innerHTML = '<span class=\'badge bg-warning text-dark\'>Cancelled</span>';">
+															<i class="fas fa-times"></i> Cancel
+														</button>
+														<button class="btn btn-success" onclick="processNow('${taskId}')">
+															<i class="fas fa-play"></i> Process Now
+														</button>
+													` : ''}
+												</div>
+											</div>
+										</div>
+									</div>
+								</div>
+								
+								<div class="card mt-3">
+									<div class="card-header bg-primary text-white">
+										<h5 class="mb-0">Analysis Results</h5>
+									</div>
+									<div class="card-body" id="${modalId}-results">
+										${task.status === 'completed' ? 'Loading results...' : 
+										  task.status === 'processing' ? 'Analysis in progress...' : 
+										  task.status === 'cancelled' ? 'Analysis was cancelled' :
+										  task.status === 'failed' ? `Analysis failed: ${task.error || 'Unknown error'}` : 
+										  'Waiting for analysis to begin...'}
+									</div>
+								</div>
+							</div>
+							<div class="modal-footer">
+								<button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+							</div>
+						</div>
+					</div>
+				</div>
+			`;
+			// Append modal to body
+			document.body.insertAdjacentHTML('beforeend', modalHTML);
+			
+			// Show modal
+			const modal = new bootstrap.Modal(document.getElementById(modalId));
+			modal.show();
+			
+			// If task is completed, load results
+			if (task.status === 'completed') {
+				loadTaskResults(taskId, `${modalId}-results`);
+			}
+			
+			// Continue updating if task is still processing
+			if (task.status === 'processing' || task.status === 'pending') {
+				updateModalTaskStatus(taskId, modalId);
+			}
+		}
+			
+			// Append modal to body
+			document.body.insertAdjacentHTML('beforeend', modalHTML);
+			
+			// Show modal
+			const modal = new bootstrap.Modal(document.getElementById(modalId));
+			modal.show();
+			
+			// If task is completed, load results
+			if (task.status === 'completed') {
+				loadTaskResults(taskId, `${modalId}-results`);
+			}
+			
+			// Continue updating if task is still processing
+			if (task.status === 'processing' || task.status === 'pending') {
+				updateModalTaskStatus(taskId, modalId);
+			}
+		}
             
             // Update a task in the queue
             updateTask(taskId, updates) {
@@ -968,6 +1160,88 @@
             }
         }
 		
+		// Function to update task status in modal
+		function updateModalTaskStatus(taskId, modalId) {
+			fetch(`/api/analysis-status/${taskId}`)
+				.then(response => response.json())
+				.then(data => {
+					if (data.success) {
+						const statusElement = document.getElementById(`${modalId}-status`);
+						const resultsElement = document.getElementById(`${modalId}-results`);
+						
+						if (statusElement) {
+							statusElement.innerHTML = getStatusBadge(data.data.status);
+						}
+						
+						if (resultsElement) {
+							if (data.data.status === 'completed') {
+								loadTaskResults(taskId, `${modalId}-results`);
+							} else if (data.data.status === 'processing') {
+								resultsElement.innerHTML = 'Analysis in progress...';
+							} else if (data.data.status === 'cancelled') {
+								resultsElement.innerHTML = 'Analysis was cancelled';
+							} else if (data.data.status === 'failed') {
+								resultsElement.innerHTML = `Analysis failed: ${data.data.error || 'Unknown error'}`;
+							}
+						}
+						
+						// If still processing or pending, continue updating
+						if (data.data.status === 'processing' || data.data.status === 'pending') {
+							setTimeout(() => updateModalTaskStatus(taskId, modalId), 2000);
+						}
+					}
+				})
+				.catch(error => console.error('Error updating modal task status:', error));
+		}
+
+		// Function to process a task immediately
+		function processNow(taskId) {
+			fetch(`/api/process-now/${taskId}`, {
+				method: 'POST'
+			})
+			.then(response => response.json())
+			.then(data => {
+				if (data.success) {
+					showNotification('Task processing started', 'success');
+					
+					// Update task status in the queue
+					analysisQueue.updateTask(taskId, { 
+						status: 'processing',
+						progress: 10
+					});
+				} else {
+					showNotification('Error starting task: ' + data.error, 'danger');
+				}
+			})
+			.catch(error => {
+				console.error('Error:', error);
+				showNotification('Error starting task', 'danger');
+			});
+		}
+
+		// Simple notification function
+		function showNotification(message, type = 'info') {
+			// Create notification element
+			const notification = document.createElement('div');
+			notification.className = `alert alert-${type} alert-dismissible fade show position-fixed`;
+			notification.style.top = '20px';
+			notification.style.right = '20px';
+			notification.style.zIndex = '9999';
+			notification.innerHTML = `
+				${message}
+				<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+			`;
+			
+			// Add to document
+			document.body.appendChild(notification);
+			
+			// Auto-remove after 5 seconds
+			setTimeout(() => {
+				notification.classList.remove('show');
+				setTimeout(() => notification.remove(), 500);
+			}, 5000);
+		}
+		
 		// Function to update the analysis status display
 		function updateAnalysisStatus(taskId) {
 			fetch(`/api/analysis-status/${taskId}`)
@@ -1069,6 +1343,107 @@
 					}
 				});
 		}
+		
+		// Function to load task results
+		function loadTaskResults(taskId, elementId) {
+			fetch(`/api/images`)
+				.then(response => response.json())
+				.then(data => {
+					if (data.success) {
+						// Find the image with the matching task ID
+						const image = data.data.find(img => img.task_id === taskId);
+						if (image && image.analysis_results) {
+							// Display results
+							document.getElementById(elementId).innerHTML = generateAnalysisResultsHTML(image.analysis_results);
+						} else {
+							document.getElementById(elementId).innerHTML = 'No analysis results available';
+						}
+					} else {
+						document.getElementById(elementId).innerHTML = 'Error loading results: ' + data.error;
+					}
+				})
+				.catch(error => {
+					console.error('Error:', error);
+					document.getElementById(elementId).innerHTML = 'Error loading results';
+				});
+		}
+
+		// Helper function to generate HTML for analysis results
+		function generateAnalysisResultsHTML(results) {
+			if (!results) return 'No results available';
+			
+			let html = '<div class="analysis-results">';
+			
+			// Overall score first
+			if (results.overall) {
+				const overallScore = results.overall.score;
+				const overallStatus = results.overall.status;
+				let statusClass;
+				
+				if (overallStatus === 'Good') {
+					statusClass = 'text-success';
+				} else if (overallStatus === 'Acceptable') {
+					statusClass = 'text-warning';
+				} else {
+					statusClass = 'text-danger';
+				}
+				
+				html += `
+					<div class="overall-score mb-3">
+						<h4>Overall Score: <span class="${statusClass}">${overallScore}% (${overallStatus})</span></h4>
+					</div>
+				`;
+			}
+			
+			// Individual categories
+			html += '<div class="categories">';
+			['cleanliness', 'hygiene', 'pest_control'].forEach(category => {
+				if (results[category]) {
+					const score = results[category].score;
+					const status = results[category].status;
+					let statusClass;
+					
+					if (status === 'Good') {
+						statusClass = 'text-success';
+					} else if (status === 'Acceptable') {
+						statusClass = 'text-warning';
+					} else {
+						statusClass = 'text-danger';
+					}
+					
+					html += `
+						<div class="category mb-2">
+							<h5>${category.charAt(0).toUpperCase() + category.slice(1)}</h5>
+							<div class="progress" style="height: 25px;">
+								<div class="progress-bar ${statusClass.replace('text-', 'bg-')}" 
+									 role="progressbar" 
+									 style="width: ${score}%" 
+									 aria-valuenow="${score}" 
+									 aria-valuemin="0" 
+									 aria-valuemax="100">
+									${score}%
+								</div>
+							</div>
+							<p class="${statusClass} mt-1">${status}</p>
+						</div>
+					`;
+				}
+			});
+			html += '</div>';
+			
+			// Comment if available
+			if (results.comment) {
+				html += `
+					<div class="comment mt-3">
+						<h5>Comments:</h5>
+						<p>${results.comment}</p>
+					</div>
+				`;
+			}
+			
+			html += '</div>';
+			return html;
+		}
 
 		// Helper function to generate HTML for analysis results
 		function generateAnalysisResultsHTML(results) {
@@ -1156,9 +1531,16 @@
 				.then(response => response.json())
 				.then(data => {
 					if (data.success) {
+						// Immediately update the task in the queue to show cancelled status
+						analysisQueue.updateTask(taskId, { 
+							status: 'cancelled',
+							progress: 100,
+							error: 'Task was cancelled by user'
+						});
+						
 						showNotification('Task cancelled successfully', 'success');
 						
-						// Immediately update the UI to show cancelled status
+						// Refresh any task details display if viewing the specific task
 						const statusElement = document.getElementById('analysisStatus');
 						if (statusElement) {
 							statusElement.innerHTML = '<span class="text-warning">Cancelled</span>';
@@ -1167,11 +1549,6 @@
 						const resultsElement = document.getElementById('analysisResults');
 						if (resultsElement) {
 							resultsElement.innerHTML = 'Analysis was cancelled';
-						}
-						
-						// Refresh the images list if available
-						if (typeof loadImages === 'function') {
-							loadImages();
 						}
 					} else {
 						showNotification('Error cancelling task: ' + data.error, 'danger');
@@ -1184,30 +1561,36 @@
 			}
 		}
 
-        function getStatusBadge(status) {
-            switch(status) {
-                case 'pending':
-                    return `<span class="badge bg-warning text-dark">
-                        <i class="fas fa-hourglass-start me-1"></i>Pending
-                    </span>`;
-                case 'processing':
-                    return `<span class="badge bg-info">
-                        <i class="fas fa-cog fa-spin me-1"></i>Processing
-                    </span>`;
-                case 'completed':
-                    return `<span class="badge bg-success">
-                        <i class="fas fa-check-circle me-1"></i>Completed
-                    </span>`;
-                case 'failed':
-                    return `<span class="badge bg-danger">
-                        <i class="fas fa-exclamation-circle me-1"></i>Failed
-                    </span>`;
-                default:
-                    return `<span class="badge bg-secondary">
-                        <i class="fas fa-question-circle me-1"></i>Unknown
-                    </span>`;
-            }
-        }
+		// Make sure to add 'cancelled' status to your helper functions
+		function getStatusBadge(status) {
+			switch(status) {
+				case 'completed':
+					return '<span class="badge bg-success">Completed</span>';
+				case 'failed':
+					return '<span class="badge bg-danger">Failed</span>';
+				case 'processing':
+					return '<span class="badge bg-primary">Processing</span>';
+				case 'cancelled':
+					return '<span class="badge bg-warning text-dark">Cancelled</span>';
+				default:
+					return '<span class="badge bg-secondary">Pending</span>';
+			}
+		}
+
+		function getProgressBarClass(status) {
+			switch(status) {
+				case 'completed':
+					return 'bg-success';
+				case 'failed':
+					return 'bg-danger';
+				case 'processing':
+					return 'bg-primary progress-bar-striped progress-bar-animated';
+				case 'cancelled':
+					return 'bg-warning';
+				default:
+					return 'bg-secondary';
+			}
+		}
 
         function getProgressBarClass(status) {
             switch(status) {
